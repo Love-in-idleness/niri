@@ -492,6 +492,10 @@ impl State {
                 }
 
                 if pressed && raw == Some(Keysym::Escape) {
+                    if this.niri.popup_grab.is_none() && this.stop_picalens() {
+                        this.niri.suppressed_keys.insert(key_code);
+                        return FilterResult::Intercept(None);
+                    }
                     // Cancel certain grabs on Escape.
                     let pointer = this.niri.seat.get_pointer().unwrap();
                     if pointer

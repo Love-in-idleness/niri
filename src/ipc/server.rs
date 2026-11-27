@@ -35,6 +35,7 @@ use crate::input::pick_window_grab::PickWindowGrab;
 use crate::layout::workspace::WorkspaceId;
 use crate::niri::State;
 use crate::utils::{version, with_toplevel_role};
+use crate::window::mapped::MappedId;
 use crate::window::Mapped;
 
 // If an event stream client fails to read events fast enough that we accumulate more than this
@@ -205,6 +206,75 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
         let request = serde_json::from_slice(&buf)
             .context("error parsing request")
             .map_err(|err| err.to_string());
+        if let Ok(Request::PicaLensStart { id, filter }) = request {
+            let id = if let Some(id) = id {
+                Some(id)
+            } else {
+                let (picked_tx, picked_rx) = async_channel::bounded(1);
+                let owner = picked_tx.clone();
+                ctx.event_loop.insert_idle(move |state| {
+                    if state.picalens_available() && state.niri.pick_window.is_none() {
+                        pick_window(state, picked_tx);
+                    } else {
+                        let _ = picked_tx.try_send(None);
+                    }
+                });
+                let mut byte = [0];
+                select_biased! {
+                    _ = read.read(&mut byte).fuse() => {
+                        ctx.event_loop.insert_idle(move |state| {
+                            if state.niri.pick_window.as_ref().is_some_and(|pick| pick.same_channel(&owner)) {
+                                let pointer = state.niri.seat.get_pointer().unwrap();
+                                let time = crate::utils::get_monotonic_time().as_millis() as u32;
+                                pointer.unset_grab(state, SERIAL_COUNTER.next_serial(), time);
+                            }
+                        });
+                        return Ok(());
+                    },
+                    id = picked_rx.recv().fuse() => id.ok().flatten().map(MappedId::get),
+                }
+            };
+            let Some(id) = id else {
+                let mut reply = serde_json::to_vec(&Reply::Ok(Response::PicaLensCancelled))?;
+                reply.push(b'\n');
+                return write
+                    .write_all(&reply)
+                    .await
+                    .context("writing selection reply");
+            };
+            let (finished_tx, finished_rx) = async_channel::bounded(1);
+            let (result_tx, result_rx) = async_channel::bounded(1);
+            let owner = finished_tx.clone();
+            ctx.event_loop.insert_idle(move |state| {
+                let result = state
+                    .start_picalens(id, filter, finished_tx)
+                    .map(|_| Response::Handled);
+                let _ = result_tx.try_send(result);
+            });
+            let result = result_rx.recv().await.context("starting presentation")?;
+            let active = result.is_ok();
+            let mut reply = serde_json::to_vec(&result).context("formatting presentation reply")?;
+            reply.push(b'\n');
+            let mut wrote = write.write_all(&reply).await;
+            if active {
+                if wrote.is_ok() {
+                    let mut byte = [0];
+                    select_biased! {
+                        result = finished_rx.recv().fuse() => {
+                            if let Ok(Some(error)) = result {
+                                let mut reply = serde_json::to_vec(&Reply::Err(error.into()))?;
+                                reply.push(b'\n');
+                                wrote = write.write_all(&reply).await;
+                            }
+                        },
+                        _ = read.read(&mut byte).fuse() => (),
+                    }
+                }
+                ctx.event_loop
+                    .insert_idle(move |state| state.stop_owned_picalens(&owner));
+            }
+            return wrote.context("writing presentation reply");
+        }
         let requested_error = matches!(request, Ok(Request::ReturnError));
         let requested_event_stream = matches!(request, Ok(Request::EventStream));
 
@@ -268,10 +338,30 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
     }
 }
 
+fn pick_window(state: &mut State, tx: Sender<Option<MappedId>>) {
+    let pointer = state.niri.seat.get_pointer().unwrap();
+    let start_data = PointerGrabStartData {
+        focus: None,
+        button: 0,
+        location: pointer.current_location(),
+    };
+    let grab = PickWindowGrab::new(start_data);
+    // The grab's ungrab handler cancels any previous pending selection.
+    pointer.set_grab(state, grab, SERIAL_COUNTER.next_serial(), Focus::Clear);
+    state.niri.pick_window = Some(tx);
+    state
+        .niri
+        .cursor_manager
+        .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
+    state.niri.queue_redraw_all();
+}
+
 async fn process(ctx: &ClientCtx, request: Request) -> Reply {
     let response = match request {
         Request::ReturnError => return Err(String::from("example compositor error")),
         Request::Version => Response::Version(version()),
+        Request::PicaLensVersion => Response::PicaLensVersion(2),
+        Request::PicaLensStart { .. } => unreachable!("presentation is bound to the IPC client"),
         Request::Outputs => {
             let ipc_outputs = ctx.ipc_outputs.lock().unwrap().clone();
             let outputs = ipc_outputs.values().cloned().map(|o| (o.name.clone(), o));
@@ -342,25 +432,8 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
         }
         Request::PickWindow => {
             let (tx, rx) = async_channel::bounded(1);
-            ctx.event_loop.insert_idle(move |state| {
-                let pointer = state.niri.seat.get_pointer().unwrap();
-                let start_data = PointerGrabStartData {
-                    focus: None,
-                    button: 0,
-                    location: pointer.current_location(),
-                };
-                let grab = PickWindowGrab::new(start_data);
-                // The `WindowPickGrab` ungrab handler will cancel the previous ongoing pick, if
-                // any.
-                pointer.set_grab(state, grab, SERIAL_COUNTER.next_serial(), Focus::Clear);
-                state.niri.pick_window = Some(tx);
-                state
-                    .niri
-                    .cursor_manager
-                    .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
-                // Redraw to update the cursor.
-                state.niri.queue_redraw_all();
-            });
+            ctx.event_loop
+                .insert_idle(move |state| pick_window(state, tx));
             let result = rx.recv().await;
             let id = result.map_err(|_| String::from("error getting picked window info"))?;
             let window = id.and_then(|id| {

@@ -119,6 +119,30 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Check whether this compositor supports PicaLens presentation.
+    PicaLensVersion,
+    /// Present the window while the owning IPC connection and its focus persist.
+    PicaLensStart {
+        /// ID of the window to present, or none to use the compositor's window picker.
+        id: Option<u64>,
+        /// Filter applied to the interactive presentation.
+        #[serde(default)]
+        filter: PicaLensFilter,
+    },
+}
+
+/// Filter for the compositor's interactive PicaLens presentation.
+#[derive(Default, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum PicaLensFilter {
+    /// Bilinear scaling.
+    #[default]
+    Linear,
+    /// FSR 1 EASU and RCAS.
+    Fsr,
+    /// Snapdragon Game Super Resolution.
+    Sgsr,
 }
 
 /// Reply from niri to client.
@@ -165,6 +189,10 @@ pub enum Response {
     OverviewState(Overview),
     /// Information about screencasts.
     Casts(Vec<Cast>),
+    /// Version of the PicaLens presentation IPC.
+    PicaLensVersion(u32),
+    /// The user cancelled picking a window.
+    PicaLensCancelled,
 }
 
 /// Overview information.

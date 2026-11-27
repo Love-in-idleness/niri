@@ -18,6 +18,7 @@ use niri_config::{
     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
     WorkspaceReference, Xkb,
 };
+use niri_ipc::PicaLensFilter;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::Keycode;
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -153,11 +154,14 @@ use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManag
 use crate::protocols::virtual_pointer::VirtualPointerManagerState;
 use crate::render_helpers::blur::BlurOptions;
 use crate::render_helpers::debug::push_opaque_regions;
+use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData};
+use crate::render_helpers::picalens::surface_scale;
 use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
+use crate::render_helpers::shaders::Shaders;
 use crate::render_helpers::renderer::NiriRenderer;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::surface::push_elements_from_surface_tree;
-use crate::render_helpers::texture::TextureBuffer;
+use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
 use crate::render_helpers::{
     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
@@ -190,6 +194,66 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
 // should be ~1.995 seconds.
 const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+
+pub(crate) struct PicaLensPresentation {
+    id: MappedId,
+    output: Output,
+    finished: async_channel::Sender<Option<&'static str>>,
+    filter: PicaLensFilter,
+    gpu: Option<PicaLensGpu>,
+}
+
+#[derive(Default)]
+struct PicaLensGpu {
+    source: OffscreenBuffer,
+    visible: RefCell<Option<OffscreenData>>,
+    failed: Cell<bool>,
+}
+
+impl PicaLensGpu {
+    fn render<R: NiriRenderer>(
+        &self,
+        mut ctx: RenderCtx<R>,
+        mapped: &Mapped,
+        destination: Rectangle<f64, Logical>,
+        output_scale: Scale<f64>,
+        filter: PicaLensFilter,
+    ) -> anyhow::Result<(PrimaryGpuTextureRenderElement, OffscreenData)> {
+        let programs = Shaders::get(ctx.renderer)
+            .picalens
+            .ok_or_else(|| anyhow::anyhow!("PicaLens shaders unavailable"))?;
+        let scale = surface_scale(mapped.toplevel().wl_surface())
+            .ok_or_else(|| anyhow::anyhow!("PicaLens source buffer unavailable"))?;
+        let mut ctx = ctx.as_gles();
+        let mut elements = Vec::new();
+        mapped.render(
+            ctx.r(),
+            Point::default(),
+            scale,
+            1.,
+            XrayPos::default(),
+            &mut |element| elements.push(element),
+        );
+        let source = Rectangle::from_size(mapped.size().to_f64()).to_physical_precise_round(scale);
+        let (element, _, mut data) =
+            self.source
+                .render_geometry(ctx.renderer, scale, source, &elements, true)?;
+        let extent = destination.to_physical_precise_round(output_scale).size;
+        let texture = programs.render(ctx.renderer, element.texture(), source.size, extent, filter)?;
+        let buffer =
+            TextureBuffer::from_texture(ctx.renderer, texture, 1., Transform::Normal, Vec::new());
+        let element = TextureRenderElement::from_texture_buffer(
+            buffer,
+            destination.loc,
+            1.,
+            None,
+            Some(destination.size),
+            Kind::Unspecified,
+        );
+        data.id = element.id().clone();
+        Ok((PrimaryGpuTextureRenderElement(element), data))
+    }
+}
 
 pub struct Niri {
     pub config: Rc<RefCell<Config>>,
@@ -393,6 +457,7 @@ pub struct Niri {
     pub pending_mru_commit: Option<PendingMruCommit>,
 
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
+    picalens: Option<PicaLensPresentation>,
     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
 
     pub debug_draw_opaque_regions: bool,
@@ -801,6 +866,13 @@ impl State {
         self.niri.popups.cleanup();
         self.refresh_popup_grab();
         self.update_keyboard_focus();
+        if let Some(presentation) = &self.niri.picalens {
+            if self.niri.picalens_geometry(&presentation.output).is_none()
+                || presentation.gpu.as_ref().is_some_and(|gpu| gpu.failed.get())
+            {
+                self.stop_picalens();
+            }
+        }
 
         // Should be called before refresh_layout() because that one will refresh other window
         // states and then send a pending configure.
@@ -987,6 +1059,78 @@ impl State {
 
         // FIXME: granular
         self.niri.queue_redraw_all();
+    }
+
+    pub(crate) fn picalens_available(&self) -> bool {
+        self.niri.picalens.is_none()
+            && !self.niri.is_locked()
+            && !self.niri.layout.is_overview_open()
+            && !self.niri.screenshot_ui.is_open()
+            && !self.niri.window_mru_ui.is_open()
+            && !self.niri.exit_confirm_dialog.is_open()
+            && !self.niri.seat.get_pointer().unwrap().is_grabbed()
+    }
+
+    pub(crate) fn start_picalens(
+        &mut self,
+        id: u64,
+        filter: PicaLensFilter,
+        finished: async_channel::Sender<Option<&'static str>>,
+    ) -> Result<(), String> {
+        if !self.picalens_available() {
+            return Err("picalens_busy".into());
+        }
+        let (id, window) = self
+            .niri
+            .layout
+            .windows()
+            .find(|(_, window)| window.id().get() == id)
+            .map(|(_, mapped)| (mapped.id(), mapped.window.clone()))
+            .ok_or("no_active_window")?;
+        self.niri.layout.activate_window(&window);
+        self.update_keyboard_focus();
+        let output = self
+            .niri
+            .layout
+            .active_output()
+            .cloned()
+            .ok_or("no_active_window")?;
+        self.niri.picalens = Some(PicaLensPresentation {
+            id,
+            output: output.clone(),
+            finished,
+            filter,
+            gpu: (filter != PicaLensFilter::Linear).then(PicaLensGpu::default),
+        });
+        if self.niri.picalens_geometry(&output).is_none() {
+            self.stop_picalens();
+            return Err("no_active_window".into());
+        }
+        self.niri.queue_redraw_all();
+        self.refresh_pointer_contents();
+        Ok(())
+    }
+
+    pub(crate) fn stop_picalens(&mut self) -> bool {
+        let Some(presentation) = self.niri.picalens.take() else {
+            return false;
+        };
+        let error = presentation.gpu.as_ref().is_some_and(|gpu| gpu.failed.get())
+            .then_some("interactive_filter_unavailable");
+        let _ = presentation.finished.try_send(error);
+        self.niri.queue_redraw_all();
+        true
+    }
+
+    pub(crate) fn stop_owned_picalens(&mut self, owner: &async_channel::Sender<Option<&'static str>>) {
+        if self
+            .niri
+            .picalens
+            .as_ref()
+            .is_some_and(|p| p.finished.same_channel(owner))
+        {
+            self.stop_picalens();
+        }
     }
 
     pub fn confirm_mru(&mut self) {
@@ -2604,6 +2748,7 @@ impl Niri {
             pending_mru_commit: None,
 
             pick_window: None,
+            picalens: None,
             pick_color: None,
 
             debug_draw_opaque_regions: false,
@@ -3231,6 +3376,55 @@ impl Niri {
         self.workspace_under(extended_bounds, pos)
     }
 
+    fn picalens_geometry(
+        &self,
+        output: &Output,
+    ) -> Option<(&Mapped, Rectangle<f64, Logical>, f64)> {
+        let presentation = self.picalens.as_ref()?;
+        if &presentation.output != output
+            || self.is_locked()
+            || self.exit_confirm_dialog.is_open()
+            || self.screenshot_ui.is_open()
+            || self.window_mru_ui.is_open()
+            || self.layout.is_overview_open()
+        {
+            return None;
+        }
+        let (mapped, focused_output) = self.layout.focus_with_output()?;
+        if mapped.id() != presentation.id || focused_output != output {
+            return None;
+        }
+        if !matches!(&self.keyboard_focus, KeyboardFocus::Layout { surface: Some(surface) } if surface == mapped.toplevel().wl_surface())
+        {
+            return None;
+        }
+        let available = self.global_space.output_geometry(output)?.size.to_f64();
+        let size = mapped.size().to_f64();
+        if size.w <= 0. || size.h <= 0. {
+            return None;
+        }
+        let zoom = (available.w / size.w).min(available.h / size.h);
+        let destination = size.upscale(zoom);
+        let offset = Point::from((
+            (available.w - destination.w) / 2.,
+            (available.h - destination.h) / 2.,
+        ));
+        Some((mapped, Rectangle::new(offset, destination), zoom))
+    }
+
+    fn picalens_input_geometry(
+        &self,
+        output: &Output,
+    ) -> Option<(&Mapped, Rectangle<f64, Logical>, f64)> {
+        let geometry = self.picalens_geometry(output)?;
+        if let Some(gpu) = self.picalens.as_ref()?.gpu.as_ref() {
+            if gpu.failed.get() || gpu.visible.borrow().is_none() {
+                return None;
+            }
+        }
+        Some(geometry)
+    }
+
     /// Returns the window under the position to be activated.
     ///
     /// The cursor may be inside the window's activation region, but not within the window's input
@@ -3245,6 +3439,10 @@ impl Niri {
         }
 
         let (output, pos_within_output) = self.output_under(pos)?;
+
+        if let Some((window, destination, _)) = self.picalens_input_geometry(output) {
+            return destination.contains(pos_within_output).then_some(window);
+        }
 
         if self.is_sticky_obscured_under(output, pos_within_output) {
             return None;
@@ -3320,6 +3518,26 @@ impl Niri {
         }
 
         if self.screenshot_ui.is_open() || self.window_mru_ui.is_open() {
+            return rv;
+        }
+
+        if let Some((mapped, destination, zoom)) = self.picalens_input_geometry(output) {
+            if destination.contains(pos_within_output) {
+                let window = &mapped.window;
+                let source = (pos_within_output - destination.loc).downscale(zoom)
+                    + window.geometry().loc.to_f64();
+                if let Some((surface, surface_loc)) =
+                    window.surface_under(source, WindowSurfaceType::ALL)
+                {
+                    rv.surface = Some((surface, pos - (source - surface_loc.to_f64())));
+                    rv.window = Some((
+                        window.clone(),
+                        HitType::Input {
+                            win_pos: pos_within_output - source,
+                        },
+                    ));
+                }
+            }
             return rv;
         }
 
@@ -4277,6 +4495,47 @@ impl Niri {
             return;
         }
 
+        if let Some((mapped, destination, zoom)) = self.picalens_geometry(output) {
+            let presentation = self.picalens.as_ref().unwrap();
+            if let Some(gpu) = &presentation.gpu {
+                match gpu.render(ctx.r(), mapped, destination, output_scale, presentation.filter) {
+                    Ok((element, data)) => {
+                        if ctx.target == RenderTarget::Output {
+                            if gpu.visible.borrow().is_none() {
+                                info!(filter = ?presentation.filter, "PicaLens interactive shader");
+                            }
+                            gpu.visible.replace(Some(data));
+                        }
+                        push(element.into());
+                        push(backdrop);
+                        return;
+                    }
+                    Err(error) => {
+                        if ctx.target == RenderTarget::Output && !gpu.failed.replace(true) {
+                            warn!("PicaLens filter failed: {error:#}");
+                        }
+                    }
+                }
+            } else {
+                mapped.render(
+                    ctx.r(),
+                    Point::default(),
+                    output_scale,
+                    1.,
+                    XrayPos::default(),
+                    &mut |element| {
+                        if let Some(element) =
+                            scale_relocate_crop(element, output_scale, zoom, destination)
+                        {
+                            push(OutputRenderElements::PicaLens(element));
+                        }
+                    },
+                );
+                push(backdrop);
+                return;
+            }
+        }
+
         // Draw the hotkey overlay on top.
         if let Some(element) = self.hotkey_overlay.render(ctx.renderer, output) {
             push(element.into());
@@ -4792,8 +5051,12 @@ impl Niri {
 
         for mapped in self.layout.windows_for_output(output) {
             let win = &mapped.window;
+            let gpu = self.picalens.as_ref()
+                .filter(|presentation| presentation.id == mapped.id() && &presentation.output == output)
+                .and_then(|presentation| presentation.gpu.as_ref())
+                .map(|gpu| gpu.visible.borrow());
             let offscreen_data = mapped.offscreen_data();
-            let offscreen_data = offscreen_data.as_ref();
+            let offscreen_data = gpu.as_deref().and_then(Option::as_ref).or(offscreen_data.as_ref());
 
             win.with_surfaces(|surface, states| {
                 let primary_scanout_output = states
@@ -6510,6 +6773,7 @@ niri_render_elements! {
     OutputRenderElements<R> => {
         Monitor = MonitorRenderElement<R>,
         RescaledTile = RescaleRenderElement<TileRenderElement<R>>,
+        PicaLens = CropRenderElement<RelocateRenderElement<RescaleRenderElement<LayoutElementRenderElement<R>>>>,
         LayerSurface = LayerSurfaceRenderElement<R>,
         RelocatedLayerSurface = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
             LayerSurfaceRenderElement<R>
