@@ -9,6 +9,7 @@ use smithay::backend::renderer::gles::{
 use super::renderer::NiriRenderer;
 use super::shader_element::ShaderProgram;
 use crate::render_helpers::blur::BlurProgram;
+use crate::render_helpers::picalens::UpscalePrograms;
 
 pub struct Shaders {
     pub border: Option<ShaderProgram>,
@@ -18,6 +19,7 @@ pub struct Shaders {
     pub resize: Option<ShaderProgram>,
     pub gradient_fade: Option<GlesTexProgram>,
     pub blur: Option<BlurProgram>,
+    pub picalens: Option<UpscalePrograms>,
     pub custom_resize: RefCell<Option<ShaderProgram>>,
     pub custom_close: RefCell<Option<ShaderProgram>>,
     pub custom_open: RefCell<Option<ShaderProgram>>,
@@ -156,6 +158,7 @@ impl Shaders {
             resize,
             gradient_fade,
             blur,
+            picalens: UpscalePrograms::compile(renderer).ok(),
             custom_resize: RefCell::new(None),
             custom_close: RefCell::new(None),
             custom_open: RefCell::new(None),

@@ -78,6 +78,19 @@ impl OffscreenBuffer {
         let _span = tracy_client::span!("OffscreenBuffer::render");
 
         let geo = encompassing_geo(scale, elements.iter());
+        self.render_geometry(renderer, scale, geo, elements, false)
+    }
+
+    pub fn render_geometry(
+        &self,
+        renderer: &mut GlesRenderer,
+        scale: Scale<f64>,
+        geo: Rectangle<i32, Physical>,
+        elements: &[impl RenderElement<GlesRenderer>],
+        exact_size: bool,
+    ) -> anyhow::Result<(OffscreenRenderElement, SyncPoint, OffscreenData)> {
+        let _span = tracy_client::span!("OffscreenBuffer::render_geometry");
+
         let elements = Vec::from_iter(elements.iter().map(|ele| {
             RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
         }));
@@ -103,9 +116,11 @@ impl OffscreenBuffer {
         }) = inner.as_mut()
         {
             let old_size = texture.size();
-            if old_size.w < src_size.w || old_size.h < src_size.h {
+            if old_size.w < src_size.w || old_size.h < src_size.h
+                || (exact_size && old_size != src_size)
+            {
                 size_string = format!(
-                    "size increased from {} × {} to {} × {}",
+                    "texture resize from {} × {} to {} × {}",
                     old_size.w, old_size.h, src_size.w, src_size.h
                 );
                 reason = &size_string;
